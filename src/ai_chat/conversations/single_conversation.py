@@ -51,20 +51,24 @@ async def process_single_conversation(
     full_response = ""  # Initialize full_response here
 
     try:
+        t0 = asyncio.get_event_loop().time()
         # Send initial signals
         await send_conversation_start_signals(websocket_send)
         logger.info(f"New Conversation Chain {session_emoji} started!")
 
         # Process user input
+        t_asr_start = asyncio.get_event_loop().time()
         input_text = await process_user_input(
             user_input, context.asr_engine, websocket_send
         )
+        t_asr_end = asyncio.get_event_loop().time()
+        logger.info(f"ASR elapsed: {t_asr_end - t_asr_start:.3f}s")
 
         # 🌟 唤醒词处理 - 多语言支持
         should_process, processed_text = await wake_word_manager.process_transcription(
             input_text, client_uid, websocket_send
         )
-
+     
         if not should_process:
             logger.debug(f"WakeWord: Ignoring input from client {client_uid} (listening mode)")
             return ""  # 忽略此次输入，不处理对话
@@ -106,6 +110,7 @@ async def process_single_conversation(
             
             # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
             agent_output_stream = context.agent_engine.chat(batch_input)
+            first_llm_token_logged = False
 
             async for output_item in agent_output_stream:
                 if (
@@ -119,6 +124,10 @@ async def process_single_conversation(
                     await websocket_send(json.dumps(output_item))
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
+                    if not first_llm_token_logged:
+                        t_llm_first = asyncio.get_event_loop().time()
+                        logger.info(f"LLM first-token latency: {t_llm_first - t_asr_end:.3f}s")
+                        first_llm_token_logged = True
                     # Handle SentenceOutput or AudioOutput
                     response_part = await process_agent_output(
                         output=output_item,
@@ -157,8 +166,11 @@ async def process_single_conversation(
 
         # Wait for any pending TTS tasks
         if tts_manager.task_list:
+            t_tts_start = asyncio.get_event_loop().time()
             await asyncio.gather(*tts_manager.task_list)
             await websocket_send(json.dumps({"type": "backend-synth-complete"}))
+            t_tts_end = asyncio.get_event_loop().time()
+            logger.info(f"TTS total elapsed: {t_tts_end - t_tts_start:.3f}s")
 
         await finalize_conversation_turn(
             tts_manager=tts_manager,
@@ -177,10 +189,12 @@ async def process_single_conversation(
             )
             logger.info(f"AI response: {full_response}")
 
+        t_end = asyncio.get_event_loop().time()
+        logger.info(f"Conversation total elapsed: {t_end - t0:.3f}s")
         return full_response  # Return accumulated full_response
 
     except asyncio.CancelledError:
-        logger.info(f"🤡👍 Conversation {session_emoji} cancelled because interrupted.")
+        logger.info(f"Conversation {session_emoji} cancelled because interrupted.")
         raise
     except Exception as e:
         logger.error(f"Error in conversation chain: {e}")

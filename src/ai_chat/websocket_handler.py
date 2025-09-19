@@ -62,6 +62,8 @@ class WebSocketHandler:
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
+        self._last_heartbeat: Dict[str, float] = {}
+        self._sweeper_task: Optional[asyncio.Task] = None
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -86,7 +88,13 @@ class WebSocketHandler:
             "heartbeat": self._handle_heartbeat,
             "mcp-tool-call": self._handle_mcp_tool_call,
             "adaptive-vad-control": self._handle_adaptive_vad_control,
+            # Frontend playback start notification - ignore to avoid noise
+            "audio-play-start": self._ignore_message,
         }
+
+    async def _ignore_message(self, *_args, **_kwargs) -> None:
+        """No-op handler for benign frontend notifications."""
+        return None
 
     async def handle_new_connection(
         self, websocket: WebSocket, client_uid: str
@@ -108,11 +116,15 @@ class WebSocketHandler:
                 websocket, client_uid, session_service_context
             )
 
+            # Ensure sweeper starts when we have an event loop
+            if not self._sweeper_task or self._sweeper_task.done():
+                self._sweeper_task = asyncio.create_task(self._sweep_stale())
+
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
             )
 
-            logger.info(f"Connection established for client {client_uid}")
+            logger.info(f"Connection established for client {client_uid}. Active: {len(self.client_connections)}")
 
         except Exception as e:
             logger.error(
@@ -254,13 +266,14 @@ class WebSocketHandler:
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
+        self._last_heartbeat.pop(client_uid, None)
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
             if task and not task.done():
                 task.cancel()
             self.current_conversation_tasks.pop(client_uid, None)
 
-        logger.info(f"Client {client_uid} disconnected")
+        logger.info(f"Client {client_uid} disconnected. Active: {len(self.client_connections)}")
         message_handler.cleanup_client(client_uid)
         
         # 清理唤醒词管理器中的客户端状态
@@ -536,9 +549,27 @@ class WebSocketHandler:
     ) -> None:
         """Handle heartbeat messages from clients"""
         try:
+            self._last_heartbeat[client_uid] = asyncio.get_event_loop().time()
             await websocket.send_json({"type": "heartbeat-ack"})
         except Exception as e:
             logger.error(f"Error sending heartbeat acknowledgment: {e}")
+
+    async def _sweep_stale(self, ttl: float = 60.0):
+        """Periodically disconnect clients that stopped heartbeating."""
+        while True:
+            try:
+                await asyncio.sleep(30)
+                now = asyncio.get_event_loop().time()
+                stale = [uid for uid, ts in list(self._last_heartbeat.items()) if now - ts > ttl]
+                for uid in stale:
+                    try:
+                        await self.handle_disconnect(uid)
+                    except Exception as e:
+                        logger.warning(f"Failed to drop stale client {uid}: {e}")
+                    finally:
+                        self._last_heartbeat.pop(uid, None)
+            except Exception as e:
+                logger.warning(f"Sweeper loop error: {e}")
 
     async def _handle_mcp_tool_call(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

@@ -174,12 +174,12 @@ async def finalize_conversation_turn(
         await websocket_send(json.dumps({"type": "backend-synth-complete"}))
 
         response = await message_handler.wait_for_response(
-            client_uid, "frontend-playback-complete"
+            client_uid, "frontend-playback-complete", timeout=15.0
         )
 
         if not response:
-            logger.warning(f"No playback completion response from {client_uid}")
-            return
+            logger.warning(f"No playback completion response from {client_uid} (timeout)")
+            # Continue gracefully without blocking subsequent turns
 
     await websocket_send(json.dumps({"type": "force-new-message"}))
 
