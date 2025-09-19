@@ -71,6 +71,8 @@ async def handle_conversation_trigger(
         existing_task = current_conversation_tasks.get(client_uid)
         if existing_task and not existing_task.done():
             existing_task.cancel()
+            # Yield control to let the cancelled task settle
+            await asyncio.sleep(0)
             logger.info(f"🛑 Cancelled existing conversation task for {client_uid}")
     except Exception as e:
         logger.warning(f"Error cancelling previous task for {client_uid}: {e}")
