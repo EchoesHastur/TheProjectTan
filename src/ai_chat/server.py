@@ -8,10 +8,12 @@ It uses FastAPI for the server and Starlette for static file serving.
 
 import os
 import shutil
+import asyncio
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
+from fastapi.responses import StreamingResponse
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from .routes import init_client_ws_route, init_webtool_routes, init_proxy_route
@@ -103,6 +105,24 @@ class WebSocketServer:
         self.app.include_router(
             init_webtool_routes(default_context_cache=self.default_context_cache),
         )
+
+        # Lightweight health endpoints (avoid heavy initialization on request)
+        @self.app.get("/health")
+        async def health():
+            return Response(content="ok", media_type="text/plain")
+
+        @self.app.get("/api/health")
+        async def api_health():
+            return Response(content="ok", media_type="text/plain")
+
+        # Minimal streaming endpoint for proxy flush testing (SSE-like)
+        @self.app.get("/api/stream")
+        async def stream_test():
+            async def gen():
+                for i in range(5):
+                    yield f"data: chunk {i}\n\n"
+                    await asyncio.sleep(0.5)
+            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
         # Initialize and include proxy routes if proxy is enabled
         system_config = config.system_config
